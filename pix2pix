@@ -1,0 +1,1858 @@
+!pip install "torchmetrics[image]" torch-fidelity lpips torchvision
+
+
+import os
+import time
+import gc
+import random
+from pathlib import Path
+
+from torchmetrics.image.kid import KernelInceptionDistance
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from torch.optim import lr_scheduler
+
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, Subset
+import torchvision
+from torchvision.models import resnet50
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f'Device: {DEVICE}')
+if DEVICE.type == 'cuda':
+    print(f'GPU: {torch.cuda.get_device_name(0)}')
+    torch.cuda.empty_cache()
+
+gc.collect()
+
+
+# =========================
+# PATH definition
+# =========================
+PATH = './pix2pix/' # MODIFY YOUR PATH HERE!!!
+
+IMG_WIDTH, IMG_HEIGHT = 256, 256
+BATCH_SIZE = 1
+NUM_WORKERS = 0
+
+# MRI-like images are usually grayscale. Set False if you really want RGB.
+USE_GRAYSCALE = True
+CHANNELS = 1 if USE_GRAYSCALE else 3
+
+# =========================
+# Optional paired data augmentation (applied to the training images)
+# =========================
+USE_DATA_AUGMENTATION = True
+AUGMENT_TRAIN = USE_DATA_AUGMENTATION
+TARGET_TRAIN_IMAGES_WITH_AUGMENTATION = 2000
+TRAIN_MIN_SIZE = TARGET_TRAIN_IMAGES_WITH_AUGMENTATION if USE_DATA_AUGMENTATION else None
+JITTER_RESIZE_HEIGHT = 286
+JITTER_RESIZE_WIDTH = 286
+# For knee MRI this flips laterality; set False unless that is acceptable for your data.
+RANDOM_HORIZONTAL_FLIP = True
+
+# =========================
+# Loss weights (synthesis-oriented)
+# =========================
+LAMBDA_L1 = 15.0
+
+# =========================
+# Optimizers (rebalanced discriminator)
+# =========================
+GEN_LR = 2e-4
+DISC_LR = 2e-4        # keep DISC_LR <= GEN_LR; lower to 1e-4 if D still dominates
+D_STEPS_PER_G = 1     # one discriminator update per generator step
+
+# =========================
+# DiffAugment (discriminator-side augmentation for small datasets)
+# =========================
+USE_DIFFAUGMENT = True
+# Policies: 'color', 'translation', 'cutout'. On 1-channel images the saturation part of
+# 'color' is effectively a no-op; brightness/contrast still apply.
+DIFFAUG_POLICY = 'color,translation,cutout'
+
+# =========================
+# Generator EMA (exponential moving average of generator weights)
+# =========================
+# Evaluating and sampling from an EMA copy of the generator almost always lowers KID and
+# smooths epoch-to-epoch noise, which makes checkpoint selection reliable.
+USE_EMA = True
+EMA_DECAY = 0.999
+EMA_START_STEP = 1000  # before this many generator steps, EMA just tracks the live weights
+
+# =========================
+# R1 gradient penalty (discriminator regularisation)
+# =========================
+# Penalises the gradient of D on real images. Useful ONLY if the discriminator is
+# overpowering the generator (D loss heading toward 0). OFF by default: an over-strong R1
+# flattens D into a constant (D loss pinned at ln(4) ~= 1.386), which removes the adversarial
+# signal and makes the generator revert to blurry, L1-only output. For this batch-1
+# conditional PatchGAN keep R1_GAMMA small and WATCH disc_loss: if it sits at ~1.386, R1 is
+# too strong. Applied every R1_INTERVAL D steps with weight R1_GAMMA/2 (no lazy interval
+# multiplier), ramped in over R1_WARMUP_STEPS so the large initial values do not kill D.
+USE_R1 = False
+R1_GAMMA = 1.0
+R1_INTERVAL = 1
+R1_WARMUP_STEPS = 2000
+
+# =========================
+# KID / RadImageNet evaluation
+# =========================
+# Path to a RadImageNet ResNet50 state_dict (PyTorch). If None or missing, the notebook
+# falls back to the backbone in KID_FALLBACK so it still runs.
+RADIMAGENET_WEIGHTS_PATH = None  # e.g. os.path.join(PATH, 'RadImageNet_ResNet50.pt')
+
+# Normalization expected by your RadImageNet port: 'imagenet' (mean/std) or 'unit' ([0,1]).
+RADIMAGENET_NORMALIZE = 'imagenet'
+
+# Fallback backbone when RadImageNet weights are unavailable:
+#   'inception'         -> torchmetrics default InceptionV3 (no extra weights to supply)
+#   'imagenet_resnet50' -> torchvision ResNet50 pretrained on ImageNet
+KID_FALLBACK = 'inception'
+
+# KID settings. subset_size is capped at min(real_pool, fakes).
+KID_SUBSETS = 100
+KID_SUBSET_SIZE = 50
+
+# KID real-distribution pooling: pool many real PD-FS images on the 'real' side so the KID
+# estimate (and its std) is stable. During training the pool is capped at this size for
+# speed; the final test cell uses every real PD-FS image (cap=None).
+KID_REAL_POOL_SIZE = 200
+KID_POOL_BATCH = 16  # batch size for feature extraction over the real pool
+
+train_scout_dir = os.path.join(PATH, 'PIX2PIX_TR/knee_scout')
+val_scout_dir = os.path.join(PATH, 'PIX2PIX_VAL/knee_scout')
+test_scout_dir = os.path.join(PATH, 'PIX2PIX_TEST/knee_scout')
+
+print(f'Train scouts: {len(os.listdir(train_scout_dir))}')
+print(f'Val scouts:   {len(os.listdir(val_scout_dir))}')
+print(f'Test scouts:  {len(os.listdir(test_scout_dir))}')
+print(f'Channels:     {CHANNELS}')
+print(f'Data augmentation enabled: {USE_DATA_AUGMENTATION}')
+print(f'DiffAugment enabled: {USE_DIFFAUGMENT} | policy: {DIFFAUG_POLICY}')
+print(f'LAMBDA_L1: {LAMBDA_L1} | GEN_LR: {GEN_LR} | DISC_LR: {DISC_LR} | D_STEPS_PER_G: {D_STEPS_PER_G}')
+print(f'EMA: {USE_EMA} (decay {EMA_DECAY}) | R1: {USE_R1} (gamma {R1_GAMMA}, every {R1_INTERVAL})')
+print(f'KID real pool (training): {KID_REAL_POOL_SIZE if KID_REAL_POOL_SIZE is not None else "all"}')
+if USE_DATA_AUGMENTATION:
+    print(f'Target train images per epoch: {TARGET_TRAIN_IMAGES_WITH_AUGMENTATION}')
+
+
+# PIL compatibility across versions
+try:
+    BICUBIC = Image.Resampling.BICUBIC
+except AttributeError:
+    BICUBIC = Image.BICUBIC
+
+
+def pil_to_tensor_normalized(img, grayscale=True):
+    """Convert PIL image to tensor [C,H,W] normalized to [-1, 1]."""
+    arr = np.array(img).astype(np.float32) / 127.5 - 1.0
+
+    if grayscale:
+        # [H, W] -> [1, H, W]
+        arr = arr[None, :, :]
+    else:
+        # [H, W, C] -> [C, H, W]
+        arr = np.transpose(arr, (2, 0, 1))
+
+    return torch.from_numpy(arr)
+
+
+def paired_random_jitter(
+    input_img,
+    target_img,
+    output_height=256,
+    output_width=256,
+    jitter_height=286,
+    jitter_width=286,
+    horizontal_flip=True,
+):
+    """Apply the same pix2pix-style random jitter to input and target PIL images.
+
+    Steps:
+    1. Resize both images to jitter_height x jitter_width.
+    2. Randomly crop the same output_height x output_width region from both.
+    3. Optionally apply the same horizontal flip to both.
+
+    This keeps the scout/target pair spatially aligned.
+    """
+
+    if jitter_height < output_height or jitter_width < output_width:
+        raise ValueError(
+            'JITTER_RESIZE_HEIGHT/WIDTH must be >= IMG_HEIGHT/IMG_WIDTH.'
+        )
+
+    input_img = input_img.resize((jitter_width, jitter_height), BICUBIC)
+    target_img = target_img.resize((jitter_width, jitter_height), BICUBIC)
+
+    max_top = jitter_height - output_height
+    max_left = jitter_width - output_width
+
+    top = random.randint(0, max_top) if max_top > 0 else 0
+    left = random.randint(0, max_left) if max_left > 0 else 0
+
+    crop_box = (
+        left,
+        top,
+        left + output_width,
+        top + output_height,
+    )
+
+    input_img = input_img.crop(crop_box)
+    target_img = target_img.crop(crop_box)
+
+    if horizontal_flip and random.random() > 0.5:
+        input_img = input_img.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+        target_img = target_img.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+
+    return input_img, target_img
+
+
+class MRIPairedDataset(Dataset):
+    """Paired scout -> target dataset with optional paired jitter augmentation.
+
+    The target path is obtained by replacing 'knee_scout' with 'knee_pdfs'.
+    This follows your original TensorFlow/PyTorch pairing logic.
+
+    When augment=True and min_size is larger than the number of original files,
+    the dataset is virtually expanded by repeating file paths. Each repeated
+    sample receives a new random jitter, so one epoch contains at least min_size
+    augmented training examples without saving duplicated images to disk.
+    """
+
+    def __init__(
+        self,
+        scout_dir,
+        img_height=256,
+        img_width=256,
+        grayscale=True,
+        augment=False,
+        min_size=None,
+        jitter_height=286,
+        jitter_width=286,
+        horizontal_flip=True,
+    ):
+        self.scout_dir = scout_dir
+        self.img_height = img_height
+        self.img_width = img_width
+        self.grayscale = grayscale
+        self.augment = augment
+        self.min_size = min_size
+        self.jitter_height = jitter_height
+        self.jitter_width = jitter_width
+        self.horizontal_flip = horizontal_flip
+
+        extensions = ('*.png', '*.jpg', '*.jpeg', '*.bmp', '*.tif', '*.tiff')
+        self.files = []
+        for ext in extensions:
+            self.files.extend(Path(scout_dir).glob(ext))
+
+        self.files = sorted([str(f) for f in self.files])
+
+        if len(self.files) == 0:
+            raise ValueError(f'No images found in: {scout_dir}')
+
+        if self.augment and self.min_size is not None:
+            self.effective_size = max(len(self.files), int(self.min_size))
+        else:
+            self.effective_size = len(self.files)
+
+    def __len__(self):
+        return self.effective_size
+
+    def _open_image(self, path):
+        if self.grayscale:
+            return Image.open(path).convert('L')
+        return Image.open(path).convert('RGB')
+
+    def __getitem__(self, idx):
+        # Use modulo indexing so the original paired images are repeated until
+        # the virtual augmented dataset reaches MIN_TRAIN_IMAGES.
+        scout_file = self.files[idx % len(self.files)]
+        target_file = scout_file.replace('knee_scout', 'knee_pdfs')
+
+        if not os.path.exists(target_file):
+            raise FileNotFoundError(
+                f'Target not found for {scout_file}: {target_file}'
+            )
+
+        input_img = self._open_image(scout_file)
+        target_img = self._open_image(target_file)
+
+        if self.augment:
+            input_img, target_img = paired_random_jitter(
+                input_img,
+                target_img,
+                output_height=self.img_height,
+                output_width=self.img_width,
+                jitter_height=self.jitter_height,
+                jitter_width=self.jitter_width,
+                horizontal_flip=self.horizontal_flip,
+            )
+        else:
+            input_img = input_img.resize((self.img_width, self.img_height), BICUBIC)
+            target_img = target_img.resize((self.img_width, self.img_height), BICUBIC)
+
+        input_image = pil_to_tensor_normalized(input_img, grayscale=self.grayscale)
+        target_image = pil_to_tensor_normalized(target_img, grayscale=self.grayscale)
+
+        return input_image, target_image
+
+
+def seed_worker(worker_id):
+    """Make DataLoader worker randomness reproducible but different per worker."""
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+train_dataset = MRIPairedDataset(
+    train_scout_dir, IMG_HEIGHT, IMG_WIDTH,
+    grayscale=USE_GRAYSCALE,
+    augment=USE_DATA_AUGMENTATION,
+    min_size=TRAIN_MIN_SIZE,
+    jitter_height=JITTER_RESIZE_HEIGHT,
+    jitter_width=JITTER_RESIZE_WIDTH,
+    horizontal_flip=RANDOM_HORIZONTAL_FLIP,
+)
+
+val_dataset = MRIPairedDataset(
+    val_scout_dir, IMG_HEIGHT, IMG_WIDTH,
+    grayscale=USE_GRAYSCALE,
+    augment=False,
+)
+
+test_dataset = MRIPairedDataset(
+    test_scout_dir, IMG_HEIGHT, IMG_WIDTH,
+    grayscale=USE_GRAYSCALE,
+    augment=False,
+)
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=NUM_WORKERS,
+    pin_memory=(DEVICE.type == 'cuda'),
+    worker_init_fn=seed_worker if NUM_WORKERS > 0 else None,
+)
+
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=NUM_WORKERS,
+    pin_memory=(DEVICE.type == 'cuda'),
+    worker_init_fn=seed_worker if NUM_WORKERS > 0 else None,
+)
+
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=NUM_WORKERS,
+    pin_memory=(DEVICE.type == 'cuda'),
+    worker_init_fn=seed_worker if NUM_WORKERS > 0 else None,
+)
+
+print(f'Original train pairs: {len(train_dataset.files)}')
+print(f'Effective train pairs per epoch: {len(train_dataset)}')
+print(f'Val pairs:   {len(val_dataset)}')
+print(f'Test pairs:  {len(test_dataset)}')
+
+if USE_DATA_AUGMENTATION:
+    print(
+        'Training augmentation: paired random jitter '
+        f'({JITTER_RESIZE_HEIGHT}x{JITTER_RESIZE_WIDTH} -> '
+        f'{IMG_HEIGHT}x{IMG_WIDTH})'
+    )
+    print(f'Paired horizontal flip: {RANDOM_HORIZONTAL_FLIP}')
+else:
+    print('Training augmentation: disabled')
+
+
+def _gaussian_kernel(window_size=11, sigma=1.5, channels=1, device='cpu'):
+    coords = torch.arange(window_size, dtype=torch.float32, device=device) - window_size // 2
+    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g = g / g.sum()
+
+    kernel_2d = torch.outer(g, g)
+    kernel_2d = kernel_2d / kernel_2d.sum()
+
+    return kernel_2d.view(1, 1, window_size, window_size).repeat(channels, 1, 1, 1)
+
+
+def ssim_torch(img1, img2, max_val=1.0, window_size=11, sigma=1.5):
+    """Mean SSIM per image for NCHW tensors in [0, 1]. Returns shape [N]."""
+    _, channels, _, _ = img1.shape
+
+    kernel = _gaussian_kernel(
+        window_size=window_size,
+        sigma=sigma,
+        channels=channels,
+        device=img1.device,
+    )
+
+    padding = window_size // 2
+
+    mu1 = F.conv2d(img1, kernel, padding=padding, groups=channels)
+    mu2 = F.conv2d(img2, kernel, padding=padding, groups=channels)
+
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = F.conv2d(img1 * img1, kernel, padding=padding, groups=channels) - mu1_sq
+    sigma2_sq = F.conv2d(img2 * img2, kernel, padding=padding, groups=channels) - mu2_sq
+    sigma12 = F.conv2d(img1 * img2, kernel, padding=padding, groups=channels) - mu1_mu2
+
+    c1 = (0.01 * max_val) ** 2
+    c2 = (0.03 * max_val) ** 2
+
+    ssim_map = ((2 * mu1_mu2 + c1) * (2 * sigma12 + c2)) / (
+        (mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2)
+    )
+
+    return ssim_map.mean(dim=(1, 2, 3))
+
+
+def to_01(x):
+    """Convert tensor from [-1, 1] to [0, 1]."""
+    return torch.clamp((x + 1.0) / 2.0, 0.0, 1.0)
+
+def valid_group_count(num_channels, max_groups=32):
+    """Return the largest group count <= max_groups that divides num_channels."""
+    for g in range(min(max_groups, num_channels), 0, -1):
+        if num_channels % g == 0:
+            return g
+    return 1
+
+
+def weights_init_normal(m):
+    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+        nn.init.normal_(m.weight.data, mean=0.0, std=0.02)
+        if m.bias is not None:
+            nn.init.constant_(m.bias.data, 0.0)
+
+    elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+        if getattr(m, 'weight', None) is not None:
+            nn.init.normal_(m.weight.data, mean=1.0, std=0.02)
+        if getattr(m, 'bias', None) is not None:
+            nn.init.constant_(m.bias.data, 0.0)
+
+
+class DownSample(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=4, apply_norm=True):
+        super().__init__()
+
+        layers = [
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                stride=2,
+                padding=1,
+                bias=False,
+            )
+        ]
+
+        if apply_norm:
+            layers.append(
+                nn.GroupNorm(
+                    num_groups=valid_group_count(out_channels),
+                    num_channels=out_channels,
+                )
+            )
+
+        layers.append(nn.LeakyReLU(0.2, inplace=True))
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class UpSample(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=4, apply_dropout=False):
+        super().__init__()
+
+        layers = [
+            nn.ConvTranspose2d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                stride=2,
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(
+                num_groups=valid_group_count(out_channels),
+                num_channels=out_channels,
+            ),
+        ]
+
+        if apply_dropout:
+            layers.append(nn.Dropout(0.5))
+
+        layers.append(nn.ReLU(inplace=True))
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.model(x)
+
+class GeneratorUNet(nn.Module):
+    def __init__(self, in_channels=1, out_channels=1):
+        super().__init__()
+
+        self.down1 = DownSample(in_channels, 64, apply_norm=False)
+        self.down2 = DownSample(64, 128)
+        self.down3 = DownSample(128, 256)
+        self.down4 = DownSample(256, 512)
+        self.down5 = DownSample(512, 512)
+        self.down6 = DownSample(512, 512)
+        self.down7 = DownSample(512, 512)
+        self.down8 = DownSample(512, 512)
+
+        self.up1 = UpSample(512, 512, apply_dropout=True)
+        self.up2 = UpSample(1024, 512, apply_dropout=True)
+        self.up3 = UpSample(1024, 512, apply_dropout=True)
+        self.up4 = UpSample(1024, 512)
+        self.up5 = UpSample(1024, 256)
+        self.up6 = UpSample(512, 128)
+        self.up7 = UpSample(256, 64)
+
+        self.last = nn.Sequential(
+            nn.ConvTranspose2d(128, out_channels, kernel_size=4, stride=2, padding=1),
+            nn.Tanh(),
+        )
+
+    def forward(self, x):
+        d1 = self.down1(x)
+        d2 = self.down2(d1)
+        d3 = self.down3(d2)
+        d4 = self.down4(d3)
+        d5 = self.down5(d4)
+        d6 = self.down6(d5)
+        d7 = self.down7(d6)
+        d8 = self.down8(d7)
+
+        u1 = torch.cat([self.up1(d8), d7], dim=1)
+        u2 = torch.cat([self.up2(u1), d6], dim=1)
+        u3 = torch.cat([self.up3(u2), d5], dim=1)
+        u4 = torch.cat([self.up4(u3), d4], dim=1)
+        u5 = torch.cat([self.up5(u4), d3], dim=1)
+        u6 = torch.cat([self.up6(u5), d2], dim=1)
+        u7 = torch.cat([self.up7(u6), d1], dim=1)
+
+        return self.last(u7)
+
+
+class DiscriminatorPatchGAN(nn.Module):
+    def __init__(self, in_channels=1):
+        super().__init__()
+
+        self.down1 = DownSample(in_channels * 2, 64, apply_norm=False)
+        self.down2 = DownSample(64, 128)
+        self.down3 = DownSample(128, 256)
+
+        self.model = nn.Sequential(
+            nn.ZeroPad2d(1),
+            nn.Conv2d(256, 512, kernel_size=4, stride=1, padding=0, bias=False),
+            nn.GroupNorm(
+                num_groups=valid_group_count(512),
+                num_channels=512,
+            ),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.ZeroPad2d(1),
+            nn.Conv2d(512, 1, kernel_size=4, stride=1, padding=0),
+        )
+
+    def forward(self, inp, tar):
+        x = torch.cat([inp, tar], dim=1)
+        x = self.down1(x)
+        x = self.down2(x)
+        x = self.down3(x)
+        return self.model(x)
+
+
+generator = GeneratorUNet(in_channels=CHANNELS, out_channels=CHANNELS).to(DEVICE)
+discriminator = DiscriminatorPatchGAN(in_channels=CHANNELS).to(DEVICE)
+
+generator.apply(weights_init_normal)
+discriminator.apply(weights_init_normal)
+
+# EMA copy of the generator, used for evaluation / KID selection / sampling.
+import copy
+generator_ema = copy.deepcopy(generator).to(DEVICE)
+for _p in generator_ema.parameters():
+    _p.requires_grad_(False)
+generator_ema.eval()
+
+print('Generator and discriminator created successfully.')
+print(f'Generator input/output channels: {CHANNELS}')
+print(f'EMA generator created (USE_EMA={USE_EMA}).')
+
+
+criterion_gan = nn.BCEWithLogitsLoss()
+criterion_l1 = nn.L1Loss()
+
+generator_optimizer = torch.optim.Adam(
+    generator.parameters(),
+    lr=GEN_LR,
+    betas=(0.5, 0.999),
+)
+
+discriminator_optimizer = torch.optim.Adam(
+    discriminator.parameters(),
+    lr=DISC_LR,
+    betas=(0.5, 0.999),
+)
+
+print('Optimizers and losses configured.')
+print(f'LAMBDA_L1: {LAMBDA_L1}')
+print(f'GEN_LR:    {GEN_LR}')
+print(f'DISC_LR:   {DISC_LR}')
+
+
+from torch.optim import lr_scheduler
+
+
+# Linear LR decay schedule. Defined here (before the schedulers) so the notebook runs
+# top-to-bottom. It is also (identically) redefined later for backward compatibility.
+def lr_lambda(epoch):
+    decay_start_epoch = 100
+    total_epochs = 200
+    if epoch < decay_start_epoch:
+        return 1.0
+    return 1.0 - (epoch - decay_start_epoch) / (total_epochs - decay_start_epoch)
+
+
+gen_scheduler = lr_scheduler.LambdaLR(generator_optimizer, lr_lambda=lr_lambda)
+disc_scheduler = lr_scheduler.LambdaLR(discriminator_optimizer, lr_lambda=lr_lambda)
+
+
+def generator_loss(disc_generated_output, gen_output, target):
+    gan_loss = criterion_gan(
+        disc_generated_output,
+        torch.ones_like(disc_generated_output),
+    )
+
+    l1_loss = criterion_l1(gen_output, target)
+
+    # Synthesis-oriented objective: adversarial term + light L1 anchor (no SSIM term).
+    total_gen_loss = gan_loss + LAMBDA_L1 * l1_loss
+
+    return total_gen_loss, gan_loss, l1_loss
+
+
+def discriminator_loss(disc_real_output, disc_generated_output):
+    real_loss = criterion_gan(
+        disc_real_output,
+        torch.ones_like(disc_real_output),
+    )
+
+    fake_loss = criterion_gan(
+        disc_generated_output,
+        torch.zeros_like(disc_generated_output),
+    )
+
+    return real_loss + fake_loss
+
+
+def tensor_to_image(tensor):
+    """Convert tensor [-1, 1] to numpy image [0, 1] for matplotlib."""
+    tensor = tensor.detach().cpu().float()
+    tensor = to_01(tensor)
+
+    if tensor.shape[0] == 1:
+        return tensor.squeeze(0).numpy()
+
+    return tensor.permute(1, 2, 0).numpy()
+
+
+@torch.no_grad()
+def generate_images(
+    model,
+    test_input,
+    target,
+    epoch,
+    save=True,
+    split_name='Validation',
+    filename_prefix='val',
+):
+    """Plot input, ground truth, and prediction for a fixed example.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        Generator model.
+    test_input : torch.Tensor
+        Input image batch in [-1, 1].
+    target : torch.Tensor
+        Target image batch in [-1, 1].
+    epoch : int
+        Zero-based epoch index.
+    save : bool
+        If True, saves the figure to disk.
+    split_name : str
+        Name shown in the figure title, e.g., 'Training' or 'Validation'.
+    filename_prefix : str
+        Prefix used in the saved image filename.
+    """
+    model.eval()
+
+    prediction = model(test_input.to(DEVICE))
+
+    display_list = [
+        tensor_to_image(test_input[0]),
+        tensor_to_image(target[0]),
+        tensor_to_image(prediction[0]),
+    ]
+
+    title = [
+        f'{split_name} Input',
+        f'{split_name} Ground Truth',
+        f'{split_name} Prediction (Epoch {epoch + 1})',
+    ]
+
+    plt.figure(figsize=(15, 5))
+
+    for i in range(3):
+        plt.subplot(1, 3, i + 1)
+        plt.title(title[i])
+
+        if display_list[i].ndim == 2:
+            plt.imshow(display_list[i], cmap='gray', vmin=0, vmax=1)
+        else:
+            plt.imshow(display_list[i])
+
+        plt.axis('off')
+
+    if save:
+        save_path = os.path.join(PATH, 'training_progress_pytorch_modified')
+        os.makedirs(save_path, exist_ok=True)
+        plt.savefig(
+            os.path.join(save_path, f'{filename_prefix}_epoch_{epoch + 1:04d}.png'),
+            bbox_inches='tight',
+            dpi=150,
+        )
+
+    plt.show()
+    model.train()
+
+
+@torch.no_grad()
+def plot_single_result(
+    model,
+    input_image,
+    target,
+    split_name,
+    sample_index,
+    output_dir=None,
+    save=True,
+    show=False,
+    dpi=150,
+):
+    """Plot input, ground truth, and model prediction for one sample."""
+    model.eval()
+
+    if input_image.dim() == 3:
+        input_image = input_image.unsqueeze(0)
+    if target.dim() == 3:
+        target = target.unsqueeze(0)
+
+    prediction = model(input_image.to(DEVICE, non_blocking=True))
+
+    display_list = [
+        tensor_to_image(input_image[0]),
+        tensor_to_image(target[0]),
+        tensor_to_image(prediction[0]),
+    ]
+
+    titles = [
+        f'{split_name} Input',
+        f'{split_name} Ground Truth',
+        f'{split_name} Prediction',
+    ]
+
+    plt.figure(figsize=(15, 5))
+
+    for i, img in enumerate(display_list):
+        plt.subplot(1, 3, i + 1)
+        plt.title(titles[i])
+        if img.ndim == 2:
+            plt.imshow(img, cmap='gray', vmin=0, vmax=1)
+        else:
+            plt.imshow(img)
+        plt.axis('off')
+
+    plt.suptitle(f'{split_name} sample {sample_index}', y=1.02)
+    plt.tight_layout()
+
+    saved_file = None
+    if save:
+        if output_dir is None:
+            output_dir = os.path.join(PATH, 'final_results_pytorch_modified', split_name.lower())
+        os.makedirs(output_dir, exist_ok=True)
+        saved_file = os.path.join(output_dir, f'{split_name.lower()}_sample_{sample_index:04d}.png')
+        plt.savefig(saved_file, bbox_inches='tight', dpi=dpi)
+
+    if show:
+        plt.show()
+    else:
+        plt.close()
+
+    model.train()
+    return saved_file
+
+
+@torch.no_grad()
+def plot_dataset_results(
+    model,
+    dataset,
+    split_name,
+    output_dir,
+    max_samples=None,
+    random_subset=False,
+    seed=42,
+    batch_size=1,
+    show=False,
+):
+    """Plot model results for a full dataset or for a random subset.
+
+    The function saves one figure per sample with three panels:
+    input, ground truth, and prediction.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        Generator model.
+    dataset : torch.utils.data.Dataset
+        Dataset to evaluate.
+    split_name : str
+        Name used in figure titles and filenames.
+    output_dir : str
+        Folder where the result images will be saved.
+    max_samples : int or None
+        Number of samples to plot. If None, plots the full dataset.
+    random_subset : bool
+        If True, randomly samples max_samples indices from the dataset.
+    seed : int
+        Random seed used when random_subset=True.
+    batch_size : int
+        Batch size for plotting. The function saves one image per sample.
+    show : bool
+        If True, displays each figure in the notebook. For large validation/test
+        sets, keep this False to avoid a very large notebook output.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    n_total = len(dataset)
+
+    if max_samples is None or max_samples >= n_total:
+        indices = list(range(n_total))
+    else:
+        if random_subset:
+            rng = random.Random(seed)
+            indices = sorted(rng.sample(range(n_total), max_samples))
+        else:
+            indices = list(range(max_samples))
+
+    subset = Subset(dataset, indices)
+    loader = DataLoader(
+        subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=(DEVICE.type == 'cuda'),
+        worker_init_fn=seed_worker if NUM_WORKERS > 0 else None,
+    )
+
+    saved_files = []
+    model.eval()
+
+    for batch_id, (input_batch, target_batch) in enumerate(loader):
+        current_batch_size = input_batch.shape[0]
+        for j in range(current_batch_size):
+            local_pos = batch_id * batch_size + j
+            original_index = indices[local_pos]
+            saved_file = plot_single_result(
+                model=model,
+                input_image=input_batch[j],
+                target=target_batch[j],
+                split_name=split_name,
+                sample_index=original_index,
+                output_dir=output_dir,
+                save=True,
+                show=show,
+            )
+            saved_files.append(saved_file)
+
+    model.eval()
+    print(f'{split_name}: saved {len(saved_files)} result figures in: {output_dir}')
+    return saved_files
+
+
+# =========================================================
+# Feature extractor for KID (RadImageNet trunk, or fallback)
+# =========================================================
+from torch.utils.data import ConcatDataset
+
+
+class ResNet50Features(nn.Module):
+    """ResNet50 trunk returning 2048-d pooled features for KID.
+
+    Accepts uint8 [0,255] (the dtype torchmetrics passes when normalize=False) or float
+    images, resizes to 224, and applies the chosen normalization. Load RadImageNet weights
+    via weights_path; otherwise optionally use the ImageNet-pretrained trunk.
+    """
+
+    def __init__(self, weights_path=None, imagenet=False, normalize_mode='imagenet'):
+        super().__init__()
+        try:
+            net = resnet50(weights='IMAGENET1K_V2' if imagenet else None)
+        except TypeError:
+            net = resnet50(pretrained=imagenet)
+        net.fc = nn.Identity()
+        self.net = net
+        self.normalize_mode = normalize_mode
+
+        if weights_path is not None and os.path.exists(weights_path):
+            sd = torch.load(weights_path, map_location='cpu')
+            if isinstance(sd, dict) and 'state_dict' in sd:
+                sd = sd['state_dict']
+            cleaned = {}
+            for k, v in sd.items():
+                nk = k
+                for pref in ('module.', 'backbone.', 'model.', 'encoder.'):
+                    if nk.startswith(pref):
+                        nk = nk[len(pref):]
+                cleaned[nk] = v
+            missing, unexpected = self.net.load_state_dict(cleaned, strict=False)
+            print(f'[KID] Loaded RadImageNet weights from: {weights_path}')
+            print(f'[KID] missing keys: {len(missing)} | unexpected keys: {len(unexpected)}')
+
+        for p in self.net.parameters():
+            p.requires_grad_(False)
+        self.net.eval()
+
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    @torch.no_grad()
+    def forward(self, x):
+        if x.dtype == torch.uint8:
+            x = x.float() / 255.0
+        else:
+            x = x.float()
+            if x.max() > 1.5:
+                x = x / 255.0
+        x = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
+        if self.normalize_mode == 'imagenet':
+            x = (x - self.mean) / self.std
+        return self.net(x)
+
+
+# Built once and reused so RadImageNet weights are not reloaded every epoch.
+_KID_FEATURE = None
+_KID_BACKEND = None
+_KID_ANNOUNCED = False
+
+
+def get_kid_feature():
+    global _KID_FEATURE, _KID_BACKEND
+    if _KID_FEATURE is not None:
+        return _KID_FEATURE, _KID_BACKEND
+
+    if RADIMAGENET_WEIGHTS_PATH is not None and os.path.exists(RADIMAGENET_WEIGHTS_PATH):
+        _KID_FEATURE = ResNet50Features(
+            weights_path=RADIMAGENET_WEIGHTS_PATH, imagenet=False,
+            normalize_mode=RADIMAGENET_NORMALIZE,
+        ).to(DEVICE)
+        _KID_BACKEND = 'RadImageNet-ResNet50'
+    elif KID_FALLBACK == 'imagenet_resnet50':
+        _KID_FEATURE = ResNet50Features(
+            weights_path=None, imagenet=True, normalize_mode='imagenet',
+        ).to(DEVICE)
+        _KID_BACKEND = 'ImageNet-ResNet50'
+    else:
+        _KID_FEATURE = 2048  # torchmetrics default InceptionV3
+        _KID_BACKEND = 'ImageNet-InceptionV3'
+
+    return _KID_FEATURE, _KID_BACKEND
+
+
+def build_kid_metric(num_real, num_fake):
+    """KID metric with subset_size capped at min(real pool, fakes)."""
+    subset_size = max(2, min(KID_SUBSET_SIZE, num_real, num_fake))
+    feature, backend = get_kid_feature()
+    kid = KernelInceptionDistance(
+        feature=feature,
+        subsets=KID_SUBSETS,
+        subset_size=subset_size,
+        normalize=False,  # we feed uint8 [0,255]
+    ).to(DEVICE)
+    return kid, subset_size, backend
+
+
+def build_real_pool_loader(batch_size=None, cap=None, splits=('train', 'val', 'test')):
+    """DataLoader over real PD-FS targets pooled across splits, for the KID 'real' side.
+
+    KID does not need paired real/fake, so the real distribution can be estimated from many
+    more images than the eval split contains. cap=None uses every image in the chosen splits.
+    """
+    dir_map = {'train': train_scout_dir, 'val': val_scout_dir, 'test': test_scout_dir}
+    datasets = [
+        MRIPairedDataset(dir_map[s], IMG_HEIGHT, IMG_WIDTH, grayscale=USE_GRAYSCALE, augment=False)
+        for s in splits
+    ]
+    pool = ConcatDataset(datasets)
+    if cap is not None and cap < len(pool):
+        g = torch.Generator().manual_seed(SEED)
+        idx = torch.randperm(len(pool), generator=g)[:cap].tolist()
+        pool = Subset(pool, idx)
+    if batch_size is None:
+        batch_size = KID_POOL_BATCH
+    return DataLoader(
+        pool, batch_size=batch_size, shuffle=False, num_workers=NUM_WORKERS,
+        pin_memory=(DEVICE.type == 'cuda'),
+    )
+
+
+@torch.no_grad()
+def evaluate_model_metrics_silent(model, loader, real_pool_loader=None):
+    """Sanity metrics (MSE / PSNR / SSIM / LPIPS) plus KID for realism.
+
+    real_pool_loader: optional loader whose *targets* form the KID 'real' distribution
+    (pooled across splits). When provided, the eval loader contributes only the fakes
+    (model predictions); the eval targets are not added again. When None, the eval targets
+    are used as the real side (original behaviour).
+    """
+    model.eval()
+
+    mse_list, psnr_list, ssim_list, lpips_list = [], [], [], []
+
+    num_fake = len(loader.dataset)
+    num_real = len(real_pool_loader.dataset) if real_pool_loader is not None else num_fake
+    kid_metric, kid_subset, kid_backend = build_kid_metric(num_real, num_fake)
+    lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type='alex').to(DEVICE)
+
+    global _KID_ANNOUNCED
+    if not _KID_ANNOUNCED:
+        print(f'[KID] backend: {kid_backend} | subset_size: {kid_subset} '
+              f'| real pool: {num_real} | fakes: {num_fake}')
+        _KID_ANNOUNCED = True
+
+    def to_uint8_3ch(img01):
+        if img01.shape[1] == 1:
+            img01 = img01.repeat(1, 3, 1, 1)
+        return (img01.clamp(0, 1) * 255).to(torch.uint8)
+
+    # Fakes (and pixel metrics) from the paired eval loader.
+    for input_image, target in loader:
+        input_image = input_image.to(DEVICE, non_blocking=True)
+        target = target.to(DEVICE, non_blocking=True)
+
+        prediction = model(input_image)
+
+        target_norm = to_01(target)
+        prediction_norm = to_01(prediction)
+
+        # Pixel sanity metrics on [0, 1]
+        mse_batch = torch.mean((target_norm - prediction_norm) ** 2, dim=(1, 2, 3))
+        psnr_batch = 10.0 * torch.log10(1.0 / (mse_batch + 1e-12))
+        ssim_batch = ssim_torch(target_norm, prediction_norm, max_val=1.0)
+
+        mse_list.extend(mse_batch.cpu().numpy())
+        psnr_list.extend(psnr_batch.cpu().numpy())
+        ssim_list.extend(ssim_batch.cpu().numpy())
+
+        # LPIPS expects [-1, 1], 3-channel
+        if target.shape[1] == 1:
+            target_3ch = target.repeat(1, 3, 1, 1)
+            pred_3ch = prediction.repeat(1, 3, 1, 1)
+        else:
+            target_3ch, pred_3ch = target, prediction
+        lpips_list.append(lpips_metric(pred_3ch.clamp(-1, 1), target_3ch.clamp(-1, 1)).item())
+
+        # KID fakes (uint8 [0,255], 3-channel)
+        kid_metric.update(to_uint8_3ch(prediction_norm), real=False)
+        if real_pool_loader is None:
+            kid_metric.update(to_uint8_3ch(target_norm), real=True)
+
+    # KID reals from the pooled real PD-FS loader (preferred).
+    if real_pool_loader is not None:
+        for batch in real_pool_loader:
+            real_imgs = batch[1] if isinstance(batch, (list, tuple)) else batch
+            real_imgs = real_imgs.to(DEVICE, non_blocking=True)
+            kid_metric.update(to_uint8_3ch(to_01(real_imgs)), real=True)
+
+    kid_mean, kid_std = kid_metric.compute()
+
+    return (
+        float(np.mean(mse_list)),
+        float(np.mean(psnr_list)),
+        float(np.mean(ssim_list)),
+        float(kid_mean.item()),
+        float(kid_std.item()),
+        float(np.mean(lpips_list)),
+    )
+
+
+# =========================================================
+# DiffAugment (Zhao et al., 2020): differentiable augmentation applied to the
+# discriminator's inputs only. The generator always sees the raw input image.
+# =========================================================
+def rand_brightness(x):
+    x = x + (torch.rand(x.size(0), 1, 1, 1, dtype=x.dtype, device=x.device) - 0.5)
+    return x
+
+
+def rand_saturation(x):
+    # On a stacked (condition, image) tensor with 1-channel inputs this couples the two
+    # channels slightly; it only regularises the discriminator and is bounded.
+    x_mean = x.mean(dim=1, keepdim=True)
+    x = (x - x_mean) * (torch.rand(x.size(0), 1, 1, 1, dtype=x.dtype, device=x.device) * 2) + x_mean
+    return x
+
+
+def rand_contrast(x):
+    x_mean = x.mean(dim=[1, 2, 3], keepdim=True)
+    x = (x - x_mean) * (torch.rand(x.size(0), 1, 1, 1, dtype=x.dtype, device=x.device) + 0.5) + x_mean
+    return x
+
+
+def rand_translation(x, ratio=0.125):
+    shift_x = int(x.size(2) * ratio + 0.5)
+    shift_y = int(x.size(3) * ratio + 0.5)
+    translation_x = torch.randint(-shift_x, shift_x + 1, size=[x.size(0), 1, 1], device=x.device)
+    translation_y = torch.randint(-shift_y, shift_y + 1, size=[x.size(0), 1, 1], device=x.device)
+    grid_batch, grid_x, grid_y = torch.meshgrid(
+        torch.arange(x.size(0), dtype=torch.long, device=x.device),
+        torch.arange(x.size(2), dtype=torch.long, device=x.device),
+        torch.arange(x.size(3), dtype=torch.long, device=x.device),
+        indexing='ij',
+    )
+    grid_x = torch.clamp(grid_x + translation_x + 1, 0, x.size(2) + 1)
+    grid_y = torch.clamp(grid_y + translation_y + 1, 0, x.size(3) + 1)
+    x_pad = F.pad(x, [1, 1, 1, 1, 0, 0, 0, 0])
+    x = x_pad.permute(0, 2, 3, 1).contiguous()[grid_batch, grid_x, grid_y]
+    x = x.permute(0, 3, 1, 2).contiguous()
+    return x
+
+
+def rand_cutout(x, ratio=0.5):
+    cut_x = int(x.size(2) * ratio + 0.5)
+    cut_y = int(x.size(3) * ratio + 0.5)
+    offset_x = torch.randint(0, x.size(2) + (1 - cut_x % 2), size=[x.size(0), 1, 1], device=x.device)
+    offset_y = torch.randint(0, x.size(3) + (1 - cut_y % 2), size=[x.size(0), 1, 1], device=x.device)
+    grid_batch, grid_x, grid_y = torch.meshgrid(
+        torch.arange(x.size(0), dtype=torch.long, device=x.device),
+        torch.arange(cut_x, dtype=torch.long, device=x.device),
+        torch.arange(cut_y, dtype=torch.long, device=x.device),
+        indexing='ij',
+    )
+    grid_x = torch.clamp(grid_x + offset_x - cut_x // 2, min=0, max=x.size(2) - 1)
+    grid_y = torch.clamp(grid_y + offset_y - cut_y // 2, min=0, max=x.size(3) - 1)
+    mask = torch.ones(x.size(0), x.size(2), x.size(3), dtype=x.dtype, device=x.device)
+    mask[grid_batch, grid_x, grid_y] = 0
+    x = x * mask.unsqueeze(1)
+    return x
+
+
+AUGMENT_FNS = {
+    'color': [rand_brightness, rand_saturation, rand_contrast],
+    'translation': [rand_translation],
+    'cutout': [rand_cutout],
+}
+
+
+def DiffAugment(x, policy=''):
+    if not policy:
+        return x
+    for p in policy.split(','):
+        p = p.strip()
+        if not p:
+            continue
+        for f in AUGMENT_FNS[p]:
+            x = f(x)
+    return x.contiguous()
+
+
+def discriminator_on_pair(disc, cond, img, policy=''):
+    """Concatenate (condition, image), DiffAugment the pair together so spatial
+    transforms stay aligned, then run the conditional PatchGAN discriminator."""
+    pair = torch.cat([cond, img], dim=1)
+    if policy:
+        pair = DiffAugment(pair, policy=policy)
+    cond_a = pair[:, :CHANNELS]
+    img_a = pair[:, CHANNELS:]
+    return disc(cond_a, img_a)
+
+
+# =========================================================
+# Generator EMA update
+# =========================================================
+@torch.no_grad()
+def update_ema(ema_model, model, decay):
+    """In-place EMA update of ema_model towards model. decay=0 copies model exactly."""
+    ema_params = dict(ema_model.named_parameters())
+    for name, param in model.named_parameters():
+        ema_params[name].mul_(decay).add_(param.detach(), alpha=1.0 - decay)
+    ema_buffers = dict(ema_model.named_buffers())
+    for name, buf in model.named_buffers():
+        if name in ema_buffers:
+            ema_buffers[name].copy_(buf)
+
+
+# =========================================================
+# R1 gradient penalty on real images
+# =========================================================
+def r1_penalty(disc, cond, real_img):
+    """R1 = E[ || grad_x D(cond, x) ||^2 ] on real images x.
+
+    Computed on the raw (non-DiffAugment) reals for numerical robustness; the gradient is
+    taken only w.r.t. the real image, with the condition held fixed.
+    """
+    real_img = real_img.detach().requires_grad_(True)
+    disc_real = discriminator_on_pair(disc, cond, real_img, policy='')
+    grad = torch.autograd.grad(
+        outputs=disc_real.sum(),
+        inputs=real_img,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    return grad.pow(2).flatten(1).sum(1).mean()
+
+
+def train_step(input_image, target, global_step):
+    input_image = input_image.to(DEVICE, non_blocking=True)
+    target = target.to(DEVICE, non_blocking=True)
+
+    policy = DIFFAUG_POLICY if USE_DIFFAUGMENT else ''
+
+    # =========================================================
+    # 1) Update discriminator (D_STEPS_PER_G times; default: once)
+    # =========================================================
+    d_loss_value = np.nan
+    r1_value = np.nan
+    for _ in range(D_STEPS_PER_G):
+        discriminator_optimizer.zero_grad(set_to_none=True)
+
+        with torch.no_grad():
+            gen_output_detached = generator(input_image)
+
+        disc_real_output = discriminator_on_pair(discriminator, input_image, target, policy)
+        disc_generated_output = discriminator_on_pair(discriminator, input_image, gen_output_detached, policy)
+
+        d_loss = discriminator_loss(disc_real_output, disc_generated_output)
+        d_loss_value = d_loss.item()  # log the adversarial part only
+
+        # R1 gradient penalty on real images (off by default; see config).
+        # Weight R1_GAMMA/2, no lazy interval multiplier, linearly warmed up so the large
+        # initial gradient norms do not collapse the discriminator.
+        if USE_R1 and (global_step % R1_INTERVAL == 0):
+            r1 = r1_penalty(discriminator, input_image, target)
+            warmup = min(1.0, (global_step + 1) / max(1, R1_WARMUP_STEPS))
+            d_loss = d_loss + (R1_GAMMA / 2.0) * r1 * warmup
+            r1_value = r1.item()
+
+        d_loss.backward()
+        discriminator_optimizer.step()
+
+    # =========================================================
+    # 2) Update generator (once). DiffAugment is differentiable, so G receives
+    #    gradients through the augmentation applied to the fake pair.
+    # =========================================================
+    generator_optimizer.zero_grad(set_to_none=True)
+
+    gen_output = generator(input_image)
+    disc_generated_output = discriminator_on_pair(discriminator, input_image, gen_output, policy)
+
+    gen_total_loss, gen_gan_loss, gen_l1_loss = generator_loss(
+        disc_generated_output, gen_output, target
+    )
+
+    gen_total_loss.backward()
+    generator_optimizer.step()
+
+    # =========================================================
+    # 3) EMA update of the generator weights.
+    # =========================================================
+    if USE_EMA:
+        decay = EMA_DECAY if global_step >= EMA_START_STEP else 0.0
+        update_ema(generator_ema, generator, decay)
+
+    return gen_total_loss.item(), gen_gan_loss.item(), gen_l1_loss.item(), d_loss_value, r1_value
+
+
+def save_checkpoint(epoch, history, filename,
+                    last_val_mse=None, last_val_psnr=None, last_val_ssim=None,
+                    last_val_kid_mean=None, last_val_kid_std=None, last_val_lpips=None):
+    ckpt_path = os.path.join(PATH, filename)
+
+    payload = {
+        'epoch': epoch + 1,
+        'generator_state_dict': generator.state_dict(),
+        'generator_ema_state_dict': generator_ema.state_dict() if USE_EMA else None,
+        'discriminator_state_dict': discriminator.state_dict(),
+        'generator_optimizer_state_dict': generator_optimizer.state_dict(),
+        'discriminator_optimizer_state_dict': discriminator_optimizer.state_dict(),
+        'history': history,
+        'config': {
+            'IMG_WIDTH': IMG_WIDTH,
+            'IMG_HEIGHT': IMG_HEIGHT,
+            'USE_GRAYSCALE': USE_GRAYSCALE,
+            'CHANNELS': CHANNELS,
+            'LAMBDA_L1': LAMBDA_L1,
+            'GEN_LR': GEN_LR,
+            'DISC_LR': DISC_LR,
+            'D_STEPS_PER_G': D_STEPS_PER_G,
+            'USE_DIFFAUGMENT': USE_DIFFAUGMENT,
+            'DIFFAUG_POLICY': DIFFAUG_POLICY,
+            'USE_EMA': USE_EMA,
+            'EMA_DECAY': EMA_DECAY,
+            'USE_R1': USE_R1,
+            'R1_GAMMA': R1_GAMMA,
+            'R1_INTERVAL': R1_INTERVAL,
+            'USE_DATA_AUGMENTATION': USE_DATA_AUGMENTATION,
+            'TARGET_TRAIN_IMAGES_WITH_AUGMENTATION': TARGET_TRAIN_IMAGES_WITH_AUGMENTATION,
+            'JITTER_RESIZE_HEIGHT': JITTER_RESIZE_HEIGHT,
+            'JITTER_RESIZE_WIDTH': JITTER_RESIZE_WIDTH,
+            'RANDOM_HORIZONTAL_FLIP': RANDOM_HORIZONTAL_FLIP,
+            'RADIMAGENET_WEIGHTS_PATH': RADIMAGENET_WEIGHTS_PATH,
+            'KID_FALLBACK': KID_FALLBACK,
+            'KID_REAL_POOL_SIZE': KID_REAL_POOL_SIZE,
+        },
+    }
+
+    for key, value in [
+        ('last_val_mse', last_val_mse),
+        ('last_val_psnr', last_val_psnr),
+        ('last_val_ssim', last_val_ssim),
+        ('last_val_kid_mean', last_val_kid_mean),
+        ('last_val_kid_std', last_val_kid_std),
+        ('last_val_lpips', last_val_lpips),
+    ]:
+        if value is not None:
+            payload[key] = value
+
+    torch.save(payload, ckpt_path)
+    return ckpt_path
+
+
+def fit(train_loader, epochs, val_loader):
+    history = {
+        'gen_total_loss': [], 'gen_gan_loss': [], 'gen_l1_loss': [], 'disc_loss': [], 'disc_r1': [],
+        'val_mse': [], 'val_psnr': [], 'val_ssim': [],
+        'val_kid_mean': [], 'val_kid_std': [], 'val_lpips': [],
+    }
+
+    best_val_kid = float('inf')
+    global_step = 0
+
+    # Model used for evaluation / sampling: the EMA copy when enabled.
+    eval_model = generator_ema if USE_EMA else generator
+
+    # Real PD-FS pool for the KID 'real' side (pooled across splits, capped for speed).
+    real_pool_loader = build_real_pool_loader(cap=KID_REAL_POOL_SIZE)
+
+    # Fixed examples for visual monitoring during training.
+    train_example_input, train_example_target = next(iter(train_loader))
+    val_example_input, val_example_target = next(iter(val_loader))
+
+    for epoch in range(epochs):
+        start = time.time()
+
+        generator.train()
+        discriminator.train()
+
+        epoch_gen_total, epoch_gen_gan, epoch_gen_l1, epoch_disc, epoch_r1 = [], [], [], [], []
+
+        for n, (input_image, target) in enumerate(train_loader):
+            gen_total_loss, gen_gan_loss, gen_l1_loss, d_loss, r1_val = train_step(
+                input_image, target, global_step
+            )
+            global_step += 1
+
+            epoch_gen_total.append(gen_total_loss)
+            epoch_gen_gan.append(gen_gan_loss)
+            epoch_gen_l1.append(gen_l1_loss)
+            if not np.isnan(d_loss):
+                epoch_disc.append(d_loss)
+            if not np.isnan(r1_val):
+                epoch_r1.append(r1_val)
+
+            if n % 10 == 0:
+                print(
+                    f'\rEpoch {epoch + 1}/{epochs} | Step {n}/{len(train_loader)} | '
+                    f'G: {gen_total_loss:.4f} | L1: {gen_l1_loss:.4f} | '
+                    f'D: {d_loss if not np.isnan(d_loss) else 0.0:.4f}',
+                    end='',
+                )
+
+        # Mean training losses
+        history['gen_total_loss'].append(float(np.mean(epoch_gen_total)))
+        history['gen_gan_loss'].append(float(np.mean(epoch_gen_gan)))
+        history['gen_l1_loss'].append(float(np.mean(epoch_gen_l1)))
+        history['disc_loss'].append(float(np.mean(epoch_disc)) if len(epoch_disc) > 0 else np.nan)
+        history['disc_r1'].append(float(np.mean(epoch_r1)) if len(epoch_r1) > 0 else np.nan)
+
+        # Validation metrics on the EMA model; KID against the pooled real set.
+        val_mse, val_psnr, val_ssim, val_kid_mean, val_kid_std, val_lpips = \
+            evaluate_model_metrics_silent(eval_model, val_loader, real_pool_loader=real_pool_loader)
+        history['val_mse'].append(val_mse)
+        history['val_psnr'].append(val_psnr)
+        history['val_ssim'].append(val_ssim)
+        history['val_kid_mean'].append(val_kid_mean)
+        history['val_kid_std'].append(val_kid_std)
+        history['val_lpips'].append(val_lpips)
+
+        print(
+            f'\nEpoch {epoch + 1}/{epochs} finished in {time.time() - start:.2f} s | '
+            f'KID(EMA): {val_kid_mean:.4f} +/- {val_kid_std:.4f} | LPIPS: {val_lpips:.4f} | '
+            f'PSNR: {val_psnr:.2f} dB | SSIM: {val_ssim:.4f} (sanity)'
+        )
+
+        # Save latest checkpoint (stores both raw and EMA generator weights)
+        save_checkpoint(
+            epoch, history, filename='mri_pix2pix_pytorch_modified_last_epoch.pth',
+            last_val_mse=val_mse, last_val_psnr=val_psnr, last_val_ssim=val_ssim,
+            last_val_kid_mean=val_kid_mean, last_val_kid_std=val_kid_std, last_val_lpips=val_lpips,
+        )
+
+        # Best checkpoint = lowest validation KID of the EMA model
+        if val_kid_mean < best_val_kid:
+            best_val_kid = val_kid_mean
+            best_path = save_checkpoint(
+                epoch, history, filename='mri_pix2pix_pytorch_modified_best_kid.pth',
+                last_val_mse=val_mse, last_val_psnr=val_psnr, last_val_ssim=val_ssim,
+                last_val_kid_mean=val_kid_mean, last_val_kid_std=val_kid_std, last_val_lpips=val_lpips,
+            )
+            print(f'Best checkpoint saved: {best_path} | Best Val KID: {best_val_kid:.4f}')
+
+        # Step schedulers at the end of the epoch
+        gen_scheduler.step()
+        disc_scheduler.step()
+
+        # Visual progress saves (from the EMA model)
+        generate_images(eval_model, train_example_input, train_example_target, epoch, save=True, split_name='Training', filename_prefix='train')
+        generate_images(eval_model, val_example_input, val_example_target, epoch, save=True, split_name='Validation', filename_prefix='val')
+
+    return history
+
+
+def plot_train_history(history, save_path=None, dpi=300):
+    plots = [
+        ('gen_total_loss', 'Total Generator Loss', 'Loss'),
+        ('gen_gan_loss', 'Generator GAN Loss', 'Loss'),
+        ('gen_l1_loss', 'Generator L1 Loss', 'Loss'),
+        ('disc_loss', 'Discriminator Loss', 'Loss'),
+        ('disc_r1', 'Discriminator R1 penalty', 'R1'),
+        ('val_kid_mean', 'Validation KID (lower = better)', 'KID'),
+        ('val_lpips', 'Validation LPIPS (lower = better)', 'LPIPS'),
+        ('val_psnr', 'Validation PSNR (sanity)', 'PSNR (dB)'),
+        ('val_ssim', 'Validation SSIM (sanity)', 'SSIM'),
+    ]
+
+    for key, title, ylabel in plots:
+        if key not in history or len(history[key]) == 0:
+            continue
+        if np.all(np.isnan(np.array(history[key], dtype=float))):
+            continue
+
+        plt.figure(figsize=(7, 5))
+        plt.plot(history[key], label=key)
+
+        # Shade KID +/- std if available.
+        if key == 'val_kid_mean' and 'val_kid_std' in history and len(history['val_kid_std']) == len(history[key]):
+            m = np.array(history['val_kid_mean'])
+            s = np.array(history['val_kid_std'])
+            xs = np.arange(len(m))
+            plt.fill_between(xs, m - s, m + s, alpha=0.2)
+
+        plt.title(title)
+        plt.xlabel('Epoch')
+        plt.ylabel(ylabel)
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+
+        if save_path is not None:
+            os.makedirs(save_path, exist_ok=True)
+            plt.savefig(os.path.join(save_path, f'{key}.png'), dpi=dpi, bbox_inches='tight')
+
+        plt.show()
+
+
+def lr_lambda(epoch):
+    # Total epochs = 200, Decay starts at 100
+    decay_start_epoch = 100
+    total_epochs = 200
+
+    if epoch < decay_start_epoch:
+        return 1.0
+    else:
+        # Linearly decrease from 1.0 to 0.0
+        return 1.0 - (epoch - decay_start_epoch) / (total_epochs - decay_start_epoch)
+
+EPOCHS = 200 #100
+
+history = fit(train_loader, EPOCHS, val_loader)
+
+plot_dir = os.path.join(PATH, 'loss_plots_modified')
+plot_train_history(history, save_path=plot_dir)
+
+# =========================
+# Load both checkpoints for final test comparison
+# =========================
+# Scenario 1: final model trained until the last epoch.
+last_epoch_checkpoint_path = os.path.join(
+    PATH,
+    'mri_pix2pix_pytorch_modified_last_epoch.pth',
+)
+
+# Scenario 2: model from the epoch with the best (lowest) validation KID.
+best_kid_checkpoint_path = os.path.join(
+    PATH,
+    'mri_pix2pix_pytorch_modified_best_kid.pth',
+)
+
+
+def load_generator_from_checkpoint(checkpoint_path, device=DEVICE, prefer_ema=True):
+    """Create a fresh GeneratorUNet and load weights from a checkpoint.
+
+    Prefers the EMA weights when present (that is what was evaluated/selected during
+    training); falls back to the raw generator weights otherwise.
+    """
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    model = GeneratorUNet(
+        in_channels=CHANNELS,
+        out_channels=CHANNELS,
+    ).to(device)
+
+    ema_sd = checkpoint.get('generator_ema_state_dict', None)
+    if prefer_ema and ema_sd is not None:
+        model.load_state_dict(ema_sd)
+        loaded = 'EMA'
+    else:
+        model.load_state_dict(checkpoint['generator_state_dict'])
+        loaded = 'raw'
+
+    model.eval()
+    return model, checkpoint, loaded
+
+
+generator_final_model, checkpoint_final, final_loaded = load_generator_from_checkpoint(
+    last_epoch_checkpoint_path,
+)
+
+generator_best_kid_model, checkpoint_best_kid, best_loaded = load_generator_from_checkpoint(
+    best_kid_checkpoint_path,
+)
+
+print('Both checkpoints loaded successfully.\n')
+
+print('--- Final model / last epoch checkpoint ---')
+print(f"Checkpoint file: {last_epoch_checkpoint_path}")
+print(f"Weights used: {final_loaded}")
+print(f"Epoch: {checkpoint_final.get('epoch', 'not available')}")
+print(f"Validation KID at this epoch: {checkpoint_final.get('last_val_kid_mean', 'not available')}")
+
+print('\n--- Best validation KID checkpoint ---')
+print(f"Checkpoint file: {best_kid_checkpoint_path}")
+print(f"Weights used: {best_loaded}")
+print(f"Epoch: {checkpoint_best_kid.get('epoch', 'not available')}")
+print(f"Best validation KID: {checkpoint_best_kid.get('last_val_kid_mean', 'not available')}")
+
+
+# =========================
+# Test evaluation in the two scenarios
+# =========================
+# Use every real PD-FS image (train+val+test) as the KID 'real' distribution for the final
+# numbers. Reset the announce flag so the KID backend/pool line prints for the test config.
+_KID_ANNOUNCED = False
+test_real_pool_loader = build_real_pool_loader(cap=None)
+
+test_results = {}
+
+for scenario_name, model, checkpoint in [
+    ('Final model - last epoch', generator_final_model, checkpoint_final),
+    ('Best validation KID model', generator_best_kid_model, checkpoint_best_kid),
+]:
+    test_mse, test_psnr, test_ssim, test_kid_mean, test_kid_std, test_lpips = \
+        evaluate_model_metrics_silent(model, test_loader, real_pool_loader=test_real_pool_loader)
+
+    print(
+        f'\nTest | {scenario_name}: '
+        f'KID {test_kid_mean:.4f} +/- {test_kid_std:.4f} | LPIPS {test_lpips:.4f} | '
+        f'PSNR {test_psnr:.2f} dB | SSIM {test_ssim:.4f} | MSE {test_mse:.5f}'
+    )
+
+    test_results[scenario_name] = {
+        'checkpoint_epoch': checkpoint.get('epoch', np.nan),
+        'val_kid_at_checkpoint': checkpoint.get('last_val_kid_mean', np.nan),
+        'test_mse': test_mse,
+        'test_psnr': test_psnr,
+        'test_ssim': test_ssim,
+        'test_kid_mean': test_kid_mean,
+        'test_kid_std': test_kid_std,
+        'test_lpips': test_lpips,
+    }
+
+# Build a compact comparison table.
+try:
+    import pandas as pd
+
+    test_results_df = pd.DataFrame.from_dict(test_results, orient='index')
+    test_results_df.index.name = 'scenario'
+
+    comparison_csv_path = os.path.join(PATH, 'test_comparison_last_epoch_vs_best_val_kid.csv')
+    test_results_df.to_csv(comparison_csv_path)
+
+    print('\n=== Test comparison: last epoch vs. best validation KID (EMA weights) ===')
+    display(test_results_df)
+    print(f'Comparison table saved to: {comparison_csv_path}')
+
+except ImportError:
+    print('\n=== Test comparison: last epoch vs. best validation KID (EMA weights) ===')
+    for scenario_name, values in test_results.items():
+        print(f'\n{scenario_name}')
+        for key, value in values.items():
+            print(f'  {key}: {value}')
+
+# Lowest test KID identifies the better synthesis checkpoint.
+best_test_scenario = min(
+    test_results,
+    key=lambda scenario: test_results[scenario]['test_kid_mean'],
+)
+
+print(f"\nLowest test KID among the two scenarios: {best_test_scenario}")
+print(f"Test KID: {test_results[best_test_scenario]['test_kid_mean']:.4f}")
+
+
+# =========================
+# Final qualitative plots after training
+# =========================
+# By default the qualitative figures use the final model from the last epoch.
+# To inspect the best-validation-KID model instead, set:
+# QUALITATIVE_MODEL = generator_best_kid_model
+# QUALITATIVE_MODEL_LABEL = 'best_kid'
+
+QUALITATIVE_MODEL = generator_final_model
+QUALITATIVE_MODEL_LABEL = 'last_epoch'
+
+# For the final training-set visualization, use the original train images without
+# random jitter. This makes the qualitative results easier to interpret.
+train_eval_dataset = MRIPairedDataset(
+    train_scout_dir,
+    IMG_HEIGHT,
+    IMG_WIDTH,
+    grayscale=USE_GRAYSCALE,
+    augment=False,
+)
+
+final_results_dir = os.path.join(
+    PATH,
+    'final_results_pytorch_modified',
+    QUALITATIVE_MODEL_LABEL,
+)
+
+# Set True to display all figures in the notebook. False saves the figures without
+# flooding the notebook output.
+SHOW_FINAL_PREVIEW = False
+
+# 1) Plot 20 random samples from the training set.
+train_result_files = plot_dataset_results(
+    model=QUALITATIVE_MODEL,
+    dataset=train_eval_dataset,
+    split_name='Train',
+    output_dir=os.path.join(final_results_dir, 'train_random_20'),
+    max_samples=20,
+    random_subset=True,
+    seed=SEED,
+    batch_size=1,
+    show=SHOW_FINAL_PREVIEW,
+)
+
+# 2) Plot the full validation set.
+val_result_files = plot_dataset_results(
+    model=QUALITATIVE_MODEL,
+    dataset=val_dataset,
+    split_name='Validation',
+    output_dir=os.path.join(final_results_dir, 'validation_all'),
+    max_samples=None,
+    random_subset=False,
+    batch_size=1,
+    show=SHOW_FINAL_PREVIEW,
+)
+
+# 3) Plot the full test set.
+test_result_files = plot_dataset_results(
+    model=QUALITATIVE_MODEL,
+    dataset=test_dataset,
+    split_name='Test',
+    output_dir=os.path.join(final_results_dir, 'test_all'),
+    max_samples=None,
+    random_subset=False,
+    batch_size=1,
+    show=SHOW_FINAL_PREVIEW,
+)
+
+print('\nFinal qualitative plots saved.')
+print(f'Qualitative model: {QUALITATIVE_MODEL_LABEL}')
+print(f'Train random 20: {len(train_result_files)} figures')
+print(f'Validation all:  {len(val_result_files)} figures')
+print(f'Test all:        {len(test_result_files)} figures')
+print(f'Output folder:   {final_results_dir}')
+
+
+# Optional: save qualitative test plots for the best-validation-KID model as well.
+SAVE_TEST_PLOTS_FOR_BEST_VAL_KID = False
+
+if SAVE_TEST_PLOTS_FOR_BEST_VAL_KID:
+    best_test_result_files = plot_dataset_results(
+        model=generator_best_kid_model,
+        dataset=test_dataset,
+        split_name='Test_BestValKID',
+        output_dir=os.path.join(
+            PATH,
+            'final_results_pytorch_modified',
+            'best_kid',
+            'test_all',
+        ),
+        max_samples=None,
+        random_subset=False,
+        batch_size=1,
+        show=SHOW_FINAL_PREVIEW,
+    )
+
+    print(f'Best-validation-KID test figures: {len(best_test_result_files)}')
+
+
+# =========================
+# Best-validation-KID model: detailed TEST-set report
+# =========================
+# Focused evaluation of the checkpoint with the lowest validation KID found across the
+# training epochs (loaded as generator_best_kid_model, EMA weights) on the TEST set:
+#   1) numeric metrics (+ CSV),
+#   2) a per-metric bar plot vs the last-epoch model,
+#   3) qualitative input / ground-truth / prediction triptychs for every test image.
+
+import matplotlib.pyplot as plt
+
+best_kid_model = generator_best_kid_model
+best_label = 'Best validation KID model'
+last_label = 'Final model - last epoch'
+
+# --- 1) Test metrics (reuse the comparison cell's results if present, else compute) ---
+if 'test_results' in globals() and best_label in test_results:
+    bk = test_results[best_label]
+    test_mse, test_psnr, test_ssim = bk['test_mse'], bk['test_psnr'], bk['test_ssim']
+    test_kid_mean, test_kid_std, test_lpips = bk['test_kid_mean'], bk['test_kid_std'], bk['test_lpips']
+else:
+    _pool = build_real_pool_loader(cap=None)
+    test_mse, test_psnr, test_ssim, test_kid_mean, test_kid_std, test_lpips = \
+        evaluate_model_metrics_silent(best_kid_model, test_loader, real_pool_loader=_pool)
+
+best_epoch = checkpoint_best_kid.get('epoch', 'n/a')
+val_kid_at_best = checkpoint_best_kid.get('last_val_kid_mean', float('nan'))
+
+print('=== Best-validation-KID model | TEST set ===')
+print(f'Selected epoch:           {best_epoch}')
+print(f'Validation KID @selection: {val_kid_at_best:.4f}')
+print(f'Test KID:   {test_kid_mean:.4f} +/- {test_kid_std:.4f}')
+print(f'Test LPIPS: {test_lpips:.4f}')
+print(f'Test PSNR:  {test_psnr:.2f} dB   (sanity)')
+print(f'Test SSIM:  {test_ssim:.4f}      (sanity)')
+print(f'Test MSE:   {test_mse:.5f}       (sanity)')
+
+# One-row CSV summary.
+try:
+    import pandas as pd
+    best_test_summary = pd.DataFrame([{
+        'epoch': best_epoch,
+        'val_kid_at_selection': val_kid_at_best,
+        'test_kid_mean': test_kid_mean, 'test_kid_std': test_kid_std,
+        'test_lpips': test_lpips, 'test_psnr': test_psnr,
+        'test_ssim': test_ssim, 'test_mse': test_mse,
+    }])
+    best_csv = os.path.join(PATH, 'best_val_kid_test_metrics.csv')
+    best_test_summary.to_csv(best_csv, index=False)
+    print(f'\nSaved metrics CSV: {best_csv}')
+except ImportError:
+    pass
+
+# --- 2) Per-metric bar plot (best-KID vs last-epoch when available) ---
+metric_keys = [
+    ('test_kid_mean', 'KID (lower better)'),
+    ('test_lpips',    'LPIPS (lower better)'),
+    ('test_psnr',     'PSNR dB (sanity)'),
+    ('test_ssim',     'SSIM (sanity)'),
+    ('test_mse',      'MSE (sanity)'),
+]
+best_vals = {'test_kid_mean': test_kid_mean, 'test_lpips': test_lpips,
+             'test_psnr': test_psnr, 'test_ssim': test_ssim, 'test_mse': test_mse}
+last_vals = test_results[last_label] if ('test_results' in globals() and last_label in test_results) else None
+
+fig, axes = plt.subplots(1, len(metric_keys), figsize=(3 * len(metric_keys), 4))
+for ax, (k, title) in zip(axes, metric_keys):
+    names = ['best KID']
+    vals = [best_vals[k]]
+    errs = [test_kid_std if k == 'test_kid_mean' else 0.0]
+    if last_vals is not None:
+        names.append('last epoch')
+        vals.append(last_vals[k])
+        errs.append(last_vals.get('test_kid_std', 0.0) if k == 'test_kid_mean' else 0.0)
+    colors = ['#1f77b4', '#bbbbbb'][:len(names)]
+    bars = ax.bar(names, vals, yerr=errs, capsize=4, color=colors)
+    ax.set_title(title, fontsize=10)
+    for b, v in zip(bars, vals):
+        ax.text(b.get_x() + b.get_width() / 2.0, v, f'{v:.4f}', ha='center', va='bottom', fontsize=8)
+    ax.grid(True, axis='y', alpha=0.3)
+fig.suptitle(f'Test metrics — best-validation-KID model (epoch {best_epoch})')
+fig.tight_layout()
+bar_path = os.path.join(PATH, 'best_val_kid_test_metrics_bar.png')
+os.makedirs(PATH, exist_ok=True)
+fig.savefig(bar_path, dpi=200, bbox_inches='tight')
+plt.show()
+print(f'Saved metrics bar plot: {bar_path}')
+
+# --- 3) Qualitative triptychs on the full test set (best-KID model) ---
+best_kid_test_dir = os.path.join(PATH, 'final_results_pytorch_modified', 'best_kid', 'test_all')
+best_kid_test_files = plot_dataset_results(
+    model=best_kid_model,
+    dataset=test_dataset,
+    split_name='Test_BestValKID',
+    output_dir=best_kid_test_dir,
+    max_samples=None,
+    random_subset=False,
+    batch_size=1,
+    show=False,
+)
+print(f'\nSaved {len(best_kid_test_files)} qualitative test figures to: {best_kid_test_dir}')
+
+# Inline preview of the first few test triptychs (best-KID model).
+PREVIEW_N = 6
+for i in range(min(PREVIEW_N, len(test_dataset))):
+    inp_i, tar_i = test_dataset[i]
+    plot_single_result(
+        model=best_kid_model,
+        input_image=inp_i,
+        target=tar_i,
+        split_name='Test (best val KID)',
+        sample_index=i,
+        save=False,
+        show=True,
+    )
