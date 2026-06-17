@@ -1,4 +1,5 @@
-[IEEE_GIT_.drawio.pdf](https://github.com/user-attachments/files/29066270/IEEE_GIT_.drawio.pdf)
+![Uploading workflow_pix2pix_mri.drawio.png…]()
+
 
 # pix2pix-mri-artifact-prediction
 Official implementation of the YOLOv8n + Pix2Pix cGAN pipeline for predictive downstream knee MRI artifact simulation from scout scans.
