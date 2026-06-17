@@ -1,4 +1,5 @@
-![Uploading workflow_pix2pix_mri.drawio.png…]()
+
+<img width="1470" height="525" alt="workflow_pix2pix_mri drawio" src="https://github.com/user-attachments/assets/ad3db7e4-9ecc-4464-8879-5a06a1263192" />
 
 
 # pix2pix-mri-artifact-prediction
