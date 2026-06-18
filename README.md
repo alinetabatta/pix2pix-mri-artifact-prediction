@@ -1,5 +1,5 @@
 
-<img width="1470" height="525" alt="workflow_pix2pix_mri drawio" src="https://github.com/user-attachments/assets/ad3db7e4-9ecc-4464-8879-5a06a1263192" />
+<img width="1469" height="562" alt="IEEE_Pix2Pix_metodology-Página-2 drawio" src="https://github.com/user-attachments/assets/496c3d8a-cb39-48d8-81e9-2ada29dca78b" />
 
 
 # pix2pix-mri-artifact-prediction
