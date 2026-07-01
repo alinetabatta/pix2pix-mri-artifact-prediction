@@ -25,28 +25,20 @@ Our proposed workflow shifts artifact assessment to the very beginning of the ac
 
 This repository uses a dual-stage framework requiring two distinct dataset components. To maintain repository efficiency while ensuring full scientific reproducibility, the data is distributed as follows:
 
-###  Paired Image Synthesis Dataset (Pix2Pix)
-The complete image pair dataset used to train and validate the generative network is hosted natively within this branch as a compressed archive.
 
-* **File Name:** `pix2pix_dataset.zip` (or `train.zip`, `val.zip`, and `test.zip` if split)
-* **Location:** Located in the root directory of this branch.
-* **Extraction Instructions:** 1. Clone this repository or download the zip archive directly from the file list above.
-  2. Create a folder named `dataset/` in your project root.
-  3. Extract the contents of the archive into the `dataset/` directory so that your topology matches:
-     ```text
-     └── dataset/
-         ├── train/
-         ├── val/
-         └── test/
-     ```
-
-###  Bounding Box Localization Dataset (YOLOv8)
+###  1) Bounding Box Localization Dataset (YOLOv8)
 The open-access **MetalDetecMRI-v1** dataset containing annotated sagittal scout views for orthopedic implant localization is hosted externally via Roboflow. 
 
 * **How to Access:** To preserve branch clean-lines, the direct download link and pipeline export tokens are stored in a standalone documentation file in this repository.
-* **File Location:** Navigate to the **`DATASET.md`** file located in this repository's root directory to find the active download link, versioning notes, and automated computer vision script configurations.
+* **File Location:** Navigate to the **`MetalDetecMRI-v1.md`** file located in this repository's root directory to find the active download link.
 
+* ###   2) Paired Image Synthesis Dataset (Pix2Pix)
+The complete image pair dataset used to train and validate the generative network is hosted natively within this branch as a compressed archive.
 
+* **File Name:** **UTFPR-Scout2PDFS-v1.zip** 
+* **Location:** Located in the root directory of this branch.
+* **Extraction Instructions:** Clone this repository or download the zip archive directly from the file list above.
+  
 
 ## 📊 Performance Highlights
 
