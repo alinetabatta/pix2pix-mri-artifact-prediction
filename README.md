@@ -49,3 +49,6 @@ Our framework is validated quantitatively across anatomical fidelity, localizati
 * **Texture & Quality Distribution:** Yielded an exceptionally low Kernel Inception Distance (**KID**) of **0.029**, proving outstanding image quality without assuming a parametric Gaussian feature form.
 
 ---
+
+## 🎓 Citation
+This work has been submitted to the IEEE SENSORS CONFERENCE 2026. The citation will be provided after the review process.
